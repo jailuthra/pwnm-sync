@@ -20,7 +20,7 @@
 
 import sys
 import datetime
-import notmuch
+import notmuch2
 import sqlite3
 import argparse
 import os
@@ -118,16 +118,15 @@ def main():
             raise Exception("ERROR couldn't find project '%s'" % project_name)
 
         print("Looking at project {} (id {})".format(project_name,projects[project_name]))
-        db = notmuch.Database(nmdb)
 
-        if args.epoch is None:
-            oldest_msg = get_oldest_nm_message(db, project_list)
-        else:
-            oldest_msg = args.epoch
+        with notmuch2.Database(nmdb, mode=notmuch2.Database.MODE.READ_ONLY) as db:
+            if args.epoch is None:
+                oldest_msg = get_oldest_nm_message(db, project_list)
+            else:
+                oldest_msg = args.epoch
 
-        print("Going to look at things post {}".format(oldest_msg))
-        populate_nm_patch_status(db,conn,project_name,all_my_tags)
-        db.close() # close the read-only session
+            print("Going to look at things post {}".format(oldest_msg))
+            populate_nm_patch_status(db,conn,project_name,all_my_tags)
 
         # we now have a map of project names to IDs, so we can use that.
         process_pw_patches_for_project(s, nmdb, conn, patchwork_url, project_name, projects[project_name], oldest_msg)
@@ -168,14 +167,16 @@ def get_oldest_nm_message(db, project_list):
     #for t in all_my_tags[1:]:
     #    qstr = qstr + ' or tag:{}'.format(t)
     #qstr = qstr + ')'
-    q = notmuch.Query(db, qstr)
 
-    #q.exclude_tag('pwsync')
-    q.set_sort(notmuch.Query.SORT.OLDEST_FIRST)
-    #q.set_sort(notmuch.Query.SORT.NEWEST_FIRST)
-    msgs = q.search_messages()
-    since =  datetime.datetime.fromtimestamp(next(msgs).get_date())
-    return since
+    msgs = db.messages(qstr, sort=notmuch2.Database.SORT.OLDEST_FIRST)
+
+    try:
+        first_msg = next(iter(msgs))
+        since = datetime.datetime.fromtimestamp(first_msg.date)
+        return since
+    except StopIteration:
+        # No messages found, return current time
+        return datetime.datetime.now()
 
 def insert_nm_patch_status(conn,message_id,project_name,tag):
     conn.execute('''INSERT OR REPLACE INTO nm_patch_status
@@ -192,10 +193,9 @@ def insert_nm_patch_status(conn,message_id,project_name,tag):
 def populate_nm_patch_status(db,conn,project_name,all_my_tags):
     for t in all_my_tags:
         qstr = 'tag:pw-{} and tag:pw-{}-{}'.format(project_name,project_name,t)
-        q = notmuch.Query(db, qstr)
-        msgs = q.search_messages()
+        msgs = db.messages(qstr)
         for m in msgs:
-            insert_nm_patch_status(conn,m.get_message_id(),project_name,t)
+            insert_nm_patch_status(conn,m.messageid,project_name,t)
         conn.commit()
 
 def patchwork_login(session, url):
@@ -235,69 +235,68 @@ def process_pw_patches(session, nmdb, conn, project_name, r):
         p = r.result().json()
         # We open the DB for each batch as to not hold the notmuch
         # database open blocking other writers for too long.
-        db = notmuch.Database(nmdb, mode=notmuch.Database.MODE.READ_WRITE)
-        # We initiate the async load of the next page now, as we go and make the
-        # changes to our local DBs.
-        if r.result().links.get('next'):
-            r = session.get(r.result().links['next']['url'], stream=False)
-        else:
-            # This is the last page.
-            done = True
-
-        db.begin_atomic()
-        for patch in p:
-            nr_patches_processed = nr_patches_processed + 1
-            conn.execute('''INSERT OR REPLACE INTO pw_patch_status
-            (msgid,project,patchid,state,need_sync)
-            VALUES (?,?,?,?,
-            COALESCE((SELECT 1 FROM pw_patch_status WHERE msgid=? and project=? and state IS NOT ?),
-                     (SELECT need_sync FROM pw_patch_status WHERE msgid=? and project=?),
-                     0)
-            )''',
-                         (patch['msgid'][1:-1], project_name, patch['id'], patch['state'],
-                          patch['msgid'][1:-1], project_name, patch['state'],
-                          patch['msgid'][1:-1], project_name,
-                         ))
-
-            query_str = 'id:{}'.format(patch['msgid'][1:-1])
-            q = notmuch.Query(db, query_str)
-            msgs = q.search_messages()
-            try:
-                msg = next(msgs)
-            except StopIteration:
-                print("MESSAGE NOT FOUND: '{}' - skipping".format(query_str))
-                # If we don't have the message, just continue.
-                continue
-
-            # If we need to update PW, skip setting the tags in nm
-            c = conn.cursor()
-            c.execute("SELECT state from nm_patch_status WHERE msgid=? AND project=? AND need_sync=1",
-                      [patch['msgid'][1:-1],project_name])
-            curstate = c.fetchone()
-            tag = patch['state']
-            if curstate:
-                print("Going to sync {} to patchwork for {}".format(patch['msgid'],project_name))
-                tag = curstate[0]
-
-            #msg.freeze()
-            msg.add_tag('pw-{}'.format(project_name))
-            msg.add_tag('patchwork')
-            for t in all_my_tags:
-                msg.remove_tag('pw-{}-{}'.format(project_name,t))
-
-            if tag in all_my_tags:
-                msg.add_tag('pw-{}-{}'.format(project_name,tag))
+        with notmuch2.Database(nmdb, mode=notmuch2.Database.MODE.READ_WRITE) as db:
+            # We initiate the async load of the next page now, as we go and make the
+            # changes to our local DBs.
+            if r.result().links.get('next'):
+                r = session.get(r.result().links['next']['url'], stream=False)
             else:
-                if not_approved.get(tag):
-                    not_approved[tag] = not_approved[tag] + 1
-                else:
-                    not_approved[tag] = 1
-                    #print("Not adding tag, as '{}'not in approved list".format(tag))
-            #msg.thaw()
-            insert_nm_patch_status(conn,patch['msgid'][1:-1],project_name,tag)
-        db.end_atomic()
-        conn.commit()
-        db.close()
+                # This is the last page.
+                done = True
+
+            with db.atomic():
+                for patch in p:
+                    nr_patches_processed = nr_patches_processed + 1
+                    conn.execute('''INSERT OR REPLACE INTO pw_patch_status
+                    (msgid,project,patchid,state,need_sync)
+                    VALUES (?,?,?,?,
+                    COALESCE((SELECT 1 FROM pw_patch_status WHERE msgid=? and project=? and state IS NOT ?),
+                             (SELECT need_sync FROM pw_patch_status WHERE msgid=? and project=?),
+                             0)
+                    )''',
+                                 (patch['msgid'][1:-1], project_name, patch['id'], patch['state'],
+                                  patch['msgid'][1:-1], project_name, patch['state'],
+                                  patch['msgid'][1:-1], project_name,
+                                 ))
+
+                    query_str = 'id:{}'.format(patch['msgid'][1:-1])
+                    msgs = list(db.messages(query_str))
+
+                    if not msgs:
+                        print("MESSAGE NOT FOUND: '{}' - skipping".format(query_str))
+                        # If we don't have the message, just continue.
+                        continue
+
+                    msg = msgs[0]
+
+                    # If we need to update PW, skip setting the tags in nm
+                    c = conn.cursor()
+                    c.execute("SELECT state from nm_patch_status WHERE msgid=? AND project=? AND need_sync=1",
+                              [patch['msgid'][1:-1],project_name])
+                    curstate = c.fetchone()
+                    tag = patch['state']
+                    if curstate:
+                        print("Going to sync {} to patchwork for {}".format(patch['msgid'],project_name))
+                        tag = curstate[0]
+
+                    # Add and remove tags
+                    msg.tags.add('pw-{}'.format(project_name))
+                    msg.tags.add('patchwork')
+                    for t in all_my_tags:
+                        msg.tags.discard('pw-{}-{}'.format(project_name,t))
+
+                    if tag in all_my_tags:
+                        msg.tags.add('pw-{}-{}'.format(project_name,tag))
+                    else:
+                        if not_approved.get(tag):
+                            not_approved[tag] = not_approved[tag] + 1
+                        else:
+                            not_approved[tag] = 1
+                            #print("Not adding tag, as '{}'not in approved list".format(tag))
+
+                    insert_nm_patch_status(conn,patch['msgid'][1:-1],project_name,tag)
+
+                conn.commit()
 
         print("Processed {} {} patches...".format(nr_patches_processed, project_name))
 
