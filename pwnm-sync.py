@@ -56,7 +56,7 @@ def main():
         args.config_file = None
 
     if args.config_file:
-        config = configparser.SafeConfigParser()
+        config = configparser.ConfigParser()
         config.read([args.config_file])
         config_values = dict(config.items("Defaults"))
         defaults = {**defaults, **config_values}
